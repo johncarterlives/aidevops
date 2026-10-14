@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2025-2026 Marcus Quinn
 
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import {
   chmodSync,
   closeSync,
@@ -10,7 +10,6 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -19,6 +18,9 @@ import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import { processIdentity, reconcileRuntime, terminateProcessGroup } from "./lib/playwriter-relay-lifecycle.mjs";
+
+export { terminateProcessGroup };
 
 // Reviewed pin (GH#34549). Bump only after re-proving the /version, token
 // challenge, loopback and telemetry opt-out contract against the release.
@@ -27,10 +29,7 @@ const PLAYWRITER_PACKAGE = `playwriter@${PLAYWRITER_VERSION}`;
 const RELAY_HOST = "127.0.0.1";
 const RELAY_PORT = 19988;
 const START_TIMEOUT_MS = 5_000;
-const STOP_TIMEOUT_MS = 750;
 const STATE_SCHEMA = "aidevops-playwriter-relay/v1";
-
-const delay = (milliseconds) => new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
 
 function fixedError(message) {
   return new Error(`Authenticated Playwriter relay: ${message}`);
@@ -189,115 +188,26 @@ async function waitForRelay(token, child, signal) {
     if (signal.aborted) return { reachable: false, ready: false };
     const proof = await probeAuthenticatedRelay({ token, signal });
     if (proof.ready) return proof;
-    if (proof.reachable || child.spawnFailed || child.exitCode !== null || child.signalCode !== null) return proof;
+    if (proof.reachable || childStopped(child)) return proof;
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
   } while (Date.now() < deadline);
   return { reachable: false, ready: false };
 }
 
-function signalProcess(pid, signal) {
-  try {
-    process.kill(pid, signal);
-    return true;
-  } catch (error) {
-    if (error.code === "ESRCH") return false;
-    throw error;
-  }
-}
-
-/** Only call with a group created by this launcher or validated owned state. */
-export async function terminateProcessGroup(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 1) throw fixedError("invalid owned process-group PID");
-  if (!signalProcess(-pid, "SIGTERM")) return;
-  const deadline = Date.now() + STOP_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    if (!signalProcess(-pid, 0)) return;
-    await delay(25);
-  }
-  // Check the group, not the runner's exitCode: the leader can exit first.
-  signalProcess(-pid, "SIGKILL");
-  await delay(50);
-}
-
-function processIdentity(pid) {
-  try {
-    const output = execFileSync("ps", ["-o", "pgid=,lstart=,command=", "-p", String(pid)], {
-      encoding: "utf8", timeout: 500, stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    const match = /^(\d+)\s+(\S+\s+\S+\s+\d+\s+\S+\s+\d+)\s+(.+)$/.exec(output);
-    return match ? { pgid: Number(match[1]), startedAt: match[2], command: match[3] } : null;
-  } catch {
-    return null;
-  }
-}
-
-function reviewedRelayProcess(command) {
-  const parts = command.trim().split(/\s+/);
-  if (parts.slice(-3).join(" ") !== `serve --host ${RELAY_HOST}`) return false;
-  const runner = parts.slice(0, -3);
-  // npm replaces the npx process title with this exact command on POSIX.
-  if (runner.length === 3 && basename(runner[0]) === "npm"
-      && runner[1] === "exec" && runner[2] === PLAYWRITER_PACKAGE) return true;
-  if (basename(runner[0] || "") === "node" && /[/\\]npx-cli\.js$/.test(runner[1] || "")) {
-    runner.splice(0, 2, "npx");
-  }
-  try { validatePlaywriterCommand(runner); return true; } catch { return false; }
-}
-
-function privateOwnedPath(path, directory = false) {
-  const stats = lstatSync(path);
-  return !stats.isSymbolicLink() && (directory ? stats.isDirectory() : stats.isFile())
-    && (stats.mode & 0o077) === 0 && stats.uid === process.getuid();
+function childStopped(child) {
+  return [child.spawnFailed, child.exitCode !== null, child.signalCode !== null].some(Boolean);
 }
 
 export async function reconcileOwnedRelays(runtime) {
-  const parent = resolve(runtime.directory, "..");
-  for (const entry of readdirSync(parent, { withFileTypes: true })) {
-    if (!entry.name.startsWith("session-") || !entry.isDirectory()) continue;
-    const directory = join(parent, entry.name);
-    if (directory === runtime.directory) continue;
-    const markerPath = join(directory, ".aidevops-owned-relay");
-    const statePath = join(directory, "state.json");
-    let state;
-    let ownerToken;
-    try {
-      if (![privateOwnedPath(directory, true), privateOwnedPath(markerPath), privateOwnedPath(statePath)].every(Boolean)) continue;
-      ownerToken = readFileSync(markerPath, "utf8");
-      if (!/^[\da-f]{8}(-[\da-f]{4}){3}-[\da-f]{12}$/i.test(ownerToken)) continue;
-      state = JSON.parse(readFileSync(statePath, "utf8"));
-      if (state.schema !== STATE_SCHEMA || state.owned !== true || state.host !== RELAY_HOST
-          || state.port !== RELAY_PORT || state.version !== PLAYWRITER_VERSION
-          || !Number.isSafeInteger(state.supervisorPid) || state.supervisorPid <= 1
-          || !Number.isSafeInteger(state.relayPid) || state.relayPid <= 1) continue;
-      if (signalProcess(state.supervisorPid, 0)) continue;
-    } catch {
-      // Missing, symlinked, inaccessible or malformed evidence is never authority.
-      continue;
-    }
-    if (signalProcess(state.relayPid, 0)) {
-      // A marker records historical ownership, not the identity of a reused PID.
-      // Legacy/missing birth evidence cannot authorize signaling or silent reuse.
-      if (typeof state.relayStartedAt !== "string" || !state.relayStartedAt) {
-        throw fixedError("stale owned relay has no recorded process identity; refusing reuse");
-      }
-      const identity = processIdentity(state.relayPid);
-      if (!identity) throw fixedError("could not verify stale owned relay process identity; refusing reuse");
-      if (state.relayStartedAt !== identity.startedAt) continue;
-      if (identity.pgid !== state.relayPid || !reviewedRelayProcess(identity.command)) {
-        throw fixedError("could not verify stale owned relay process group; refusing reuse");
-      }
-      await terminateProcessGroup(state.relayPid);
-    } else {
-      // Without a live leader we cannot authenticate a possibly surviving group.
-      if (signalProcess(-state.relayPid, 0)) {
-        throw fixedError("leaderless owned relay group remains; refusing unauthenticated cleanup or reuse");
-      }
-    }
-    cleanupPrivateRuntime({ directory, markerPath, ownerToken });
-  }
+  return reconcileRuntime(runtime, {
+    expected: { schema: STATE_SCHEMA, owned: true, host: RELAY_HOST, port: RELAY_PORT, version: PLAYWRITER_VERSION },
+    packageName: PLAYWRITER_PACKAGE,
+    validateCommand: validatePlaywriterCommand,
+    cleanupRuntime: cleanupPrivateRuntime,
+  });
 }
 
-async function ensureRelay(command, environment, runtime, token, relay, signal) {
+async function ensureRelay({ command, environment, runtime, token, relay, signal }) {
   await reconcileOwnedRelays(runtime);
   const existing = await probeAuthenticatedRelay({ token, signal });
   if (signal.aborted) throw fixedError("startup cancelled");
@@ -315,7 +225,7 @@ async function ensureRelay(command, environment, runtime, token, relay, signal) 
   if (!proof.ready) {
     throw fixedError("could not prove the localhost relay version and token contract");
   }
-  if (child.exitCode !== null || child.signalCode !== null || child.spawnFailed) {
+  if (childStopped(child)) {
     throw fixedError("owned relay package runner exited during startup");
   }
 }
@@ -354,7 +264,7 @@ async function supervise(command, environment) {
   const signals = ["SIGINT", "SIGTERM", "SIGHUP"];
   for (const signal of signals) process.on(signal, stop);
   try {
-    await ensureRelay(command, environment, runtime, token, relay, controller.signal);
+    await ensureRelay({ command, environment, runtime, token, relay, signal: controller.signal });
     if (stopping) return 1;
     if (!relay.owned) writeState(runtime, relay);
     mcp = spawn(command[0], command.slice(1), {
