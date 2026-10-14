@@ -270,7 +270,7 @@ test("missing recorded birth identity never authorizes killing a matching indepe
   assert.equal(existsSync(runtime.directory), true);
 });
 
-async function supervisor(t, f, ready = true) {
+async function supervisor(f, ready = true) {
   const source = `
     const { readFileSync } = await import("node:fs");
     const originalFetch = globalThis.fetch;
@@ -308,7 +308,7 @@ for (const shutdown of ["stdio-exit", "stdio-eof", "SIGINT", "SIGTERM", "SIGHUP"
   test(`supervisor ${shutdown} cleans stubborn runner groups and owned state within host grace`, { timeout: 10_000 }, async (t) => {
     const f = fixture(t);
     f.environment.TEST_RUNNER_STUBBORN = "1";
-    const child = await supervisor(t, f);
+    const child = await supervisor(f);
     const info = JSON.parse(readFileSync(f.infoPath));
     const started = Date.now();
     if (shutdown === "stdio-exit") child.stdin.write("exit\n");
@@ -331,7 +331,7 @@ for (const shutdown of ["stdio-exit", "stdio-eof", "SIGINT", "SIGTERM", "SIGHUP"
 test("cancellation during a hanging startup probe still tears down the owned group", { timeout: 10_000 }, async (t) => {
   const f = fixture(t);
   f.environment.TEST_HANG_PROBE = "1";
-  const child = await supervisor(t, f, false);
+  const child = await supervisor(f, false);
   const info = JSON.parse(readFileSync(f.infoPath));
   const started = Date.now();
   child.kill("SIGTERM");
@@ -346,7 +346,7 @@ test("cancellation during a hanging startup probe still tears down the owned gro
 
 test("a new supervisor reconciles a forcibly killed supervisor's owned relay before reuse", { timeout: 15_000 }, async (t) => {
   const f = fixture(t);
-  const first = await supervisor(t, f);
+  const first = await supervisor(f);
   const previous = JSON.parse(readFileSync(f.infoPath));
   first.kill("SIGKILL");
   await eventually(() => first.signalCode !== null);
@@ -354,7 +354,7 @@ test("a new supervisor reconciles a forcibly killed supervisor's owned relay bef
   // Stop only the synthetic MCP orphan; this test targets relay reconciliation.
   await terminateProcessGroup(Number(readFileSync(f.environment.TEST_MCP_PATH, "utf8")));
   rmSync(f.infoPath);
-  const second = await supervisor(t, f);
+  const second = await supervisor(f);
   const replacement = JSON.parse(readFileSync(f.infoPath));
   assert.notEqual(replacement.runnerPid, previous.runnerPid);
   await assertListenerClosed(previous);
@@ -366,7 +366,7 @@ test("a new supervisor reconciles a forcibly killed supervisor's owned relay bef
 
 test("interrupted group teardown fails closed instead of adopting an owned leaderless relay as external", { timeout: 10_000 }, async (t) => {
   const f = fixture(t);
-  const first = await supervisor(t, f);
+  const first = await supervisor(f);
   const info = JSON.parse(readFileSync(f.infoPath));
   first.kill("SIGTERM");
   await assertProcessStopped(info.runnerPid);
@@ -375,7 +375,7 @@ test("interrupted group teardown fails closed instead of adopting an owned leade
   assert.equal((await fetch(`http://127.0.0.1:${info.port}/version`)).status, 200);
   const current = createPrivateRuntime(f.root);
   await assert.rejects(reconcileOwnedRelays(current), /leaderless owned relay/);
-  const second = await supervisor(t, f, false);
+  const second = await supervisor(f, false);
   await eventually(() => second.exitCode !== null);
   assert.equal(second.exitCode, 1, "startup must report incomplete owned-relay recovery");
   assert.equal((await fetch(`http://127.0.0.1:${info.port}/version`)).status, 200);
@@ -387,7 +387,7 @@ test("supervisor reuses but never terminates an external authenticated listener"
   // Remove the synthetic ownership evidence, making this listener external.
   const parent = join(f.root, "mcp", "playwriter", "authenticated-relay");
   for (const entry of readdirSync(parent)) rmSync(join(parent, entry), { recursive: true });
-  const child = await supervisor(t, f);
+  const child = await supervisor(f);
   child.stdin.write("exit\n");
   await eventually(() => child.exitCode !== null);
   assert.equal(runner.exitCode, null);

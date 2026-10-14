@@ -44,13 +44,17 @@ export function processIdentity(pid) {
   }
 }
 
+function npmExecRunner(runner, packageName) {
+  return runner.length === 3 && basename(runner[0]) === "npm"
+    && runner[1] === "exec" && runner[2] === packageName;
+}
+
 function reviewedRelayProcess(command, contract) {
   const parts = command.trim().split(/\s+/);
   if (parts.slice(-3).join(" ") !== `serve --host ${contract.expected.host}`) return false;
   const runner = parts.slice(0, -3);
   // npm replaces the npx process title with this exact command on POSIX.
-  if (runner.length === 3 && basename(runner[0]) === "npm"
-      && runner[1] === "exec" && runner[2] === contract.packageName) return true;
+  if (npmExecRunner(runner, contract.packageName)) return true;
   if (basename(runner[0] || "") === "node" && /[/\\]npx-cli\.js$/.test(runner[1] || "")) {
     runner.splice(0, 2, "npx");
   }
